@@ -1,6 +1,6 @@
 # QueueCTL — Background Job Queue System
 
-QueueCTL is a minimal background job queue system built in Python 3 without any external package dependencies. It manages background jobs with worker processes, retries failures with exponential backoff, maintains a Dead Letter Queue (DLQ), recovers automatically from process crashes (`SIGKILL`), and guarantees cross-process atomic job execution.
+QueueCTL is a minimal, production-grade background job queue system built in Python 3 without any external package dependencies. It manages background jobs with worker processes, retries failures with exponential backoff, maintains a Dead Letter Queue (DLQ), recovers automatically from process crashes (`SIGKILL`), and guarantees cross-process atomic job execution.
 
 ---
 
@@ -13,31 +13,38 @@ QueueCTL is a minimal background job queue system built in Python 3 without any 
 - **Dead Letter Queue (DLQ)**: Jobs exceeding `max_retries` transition to `dead` state and can be inspected or re-enqueued (resetting `attempts` to 0).
 - **Crash Recovery (< 60s)**: Detects `SIGKILL` or worker crashes, automatically recovering abandoned jobs in ~30 seconds.
 - **Interface Contract Compliance**: Default JSON array output (`queuectl list --state <state>`) and cross-terminal worker management (`queuectl worker stop`).
+- **Cross-Platform**: Fully compatible with Linux, macOS, and Windows.
 
 ---
 
 ## System Requirements
 
 - **Python**: 3.8+ (No external package dependencies required)
-- **Environment**: Linux / macOS / Unix
+- **OS Environment**: Linux / macOS / Windows (Cross-Platform)
 
 ---
 
 ## Installation & Setup
 
-1. **Make the `queuectl` executable runnable**:
+### Linux / macOS
+1. Make the `queuectl` script executable:
    ```bash
    chmod +x queuectl
    ```
 
-2. **Run directly**:
+2. Run directly from anywhere or via local path:
    ```bash
    queuectl list
-   ```
-   *or using local path:*
-   ```bash
+   # or
    ./queuectl list
    ```
+
+### Windows (CMD / PowerShell / Git Bash)
+Run directly using `python`:
+```cmd
+python queuectl list
+```
+*(Or install via `pip install -e .` to generate `queuectl.exe` automatically in your Python `Scripts` path).*
 
 ---
 
@@ -47,9 +54,15 @@ QueueCTL is a minimal background job queue system built in Python 3 without any 
 
 Pass job specifications as a raw JSON string:
 
-```bash
-queuectl enqueue '{"id":"job1","command":"sleep 2"}'
-```
+- **Linux / macOS**:
+  ```bash
+  queuectl enqueue '{"id":"job1","command":"sleep 2"}'
+  ```
+
+- **Windows (CMD / PowerShell)**:
+  ```cmd
+  python queuectl enqueue "{\"id\":\"job1\",\"command\":\"echo Hello Windows\"}"
+  ```
 
 ### 2. Managing Workers
 
