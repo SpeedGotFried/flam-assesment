@@ -32,7 +32,7 @@ conn.execute("COMMIT")
 ```
 
 ### Why this operation is atomic
-Both the `SELECT` query and the `UPDATE` query occur inside a single `BEGIN IMMEDIATE` transaction.
+Both the `SELECT` candidate query and the `UPDATE` state query happen inside a single `BEGIN IMMEDIATE` transaction.
 
 When a worker calls `claim_job()`, `BEGIN IMMEDIATE` acquires a reserved write lock on the SQLite database file before reading candidate rows. If another worker process in a different terminal session calls `claim_job()` at the exact same instant, SQLite blocks the second process until the first worker's transaction completes (`COMMIT`).
 
@@ -45,28 +45,28 @@ Using WAL mode (`PRAGMA journal_mode=WAL;`) ensures reads don't block writes whi
 ## 2. A worker is SIGKILLed halfway through a job. Walk through, step by step, what state the job is in and how it eventually runs again. What is the worst-case delay before recovery?
 
 ### Walkthrough
-Imagine Worker A is executing `job-42`:
+Imagine Worker A claims `job-42`:
 
 1. **Execution**: `job-42` has state `processing`, `worker_id` set to Worker A, and a `last_heartbeat` timestamp set when claimed (and updated during long loops in [`queuectl_engine/worker.py:L60`](file:///home/vaish/Flam/queuectl_engine/worker.py#L60)).
-2. **SIGKILL Crash**: Worker A receives `SIGKILL` (or experiences an ungraceful OS crash). Because `SIGKILL` cannot be caught by signal traps, the process dies instantly without running cleanup handlers. `job-42` remains in SQLite with state `processing`.
-3. **Detection**: Active workers periodically polling SQLite check for candidate jobs. The SQL query matches `processing` jobs whose heartbeat is older than `stale_timeout` (30 seconds default):
+2. **SIGKILL Crash**: `SIGKILL` kills Worker A instantly. No cleanup code runs. The job stays in SQLite marked as `processing`.
+3. **Detection**: Active workers periodically polling SQLite check for candidate jobs, matching `processing` jobs whose `last_heartbeat` timestamp is older than `stale_timeout` (30 seconds default):
    ```sql
    OR (state = 'processing' AND (last_heartbeat IS NULL OR last_heartbeat <= :stale_threshold))
    ```
-4. **Re-claiming & Execution**: A healthy worker detects `job-42` as stale, updates `worker_id` to itself, resets `last_heartbeat` to `now`, and executes the command from the beginning.
+4. **Re-claiming & Execution**: A healthy worker detects `job-42` as stale, updates `worker_id` to itself, resets `last_heartbeat` to `now`, and executes the command from scratch.
 
 ### Worst-Case Recovery Delay
 - **Stale Timeout**: 30 seconds default (`queuectl config set stale-timeout <seconds>`).
 - **Worker Poll Loop**: 0.5 seconds sleep when idle.
-- **Worst-Case Delay**: **30.5 seconds** (30s stale window + 0.5s poll loop delay). This guarantees crash recovery under the required 60 seconds.
+- **Worst-Case Delay**: **30.5 seconds** (30s stale window + 0.5s poll loop delay), strictly under the required 60-second limit.
 
 ---
 
 ## 3. Does dlq retry reset attempts? Why is that the right call?
 
-Yes, `queuectl dlq retry <job_id>` resets `attempts` back to `0` and sets state to `pending`.
+Yes, `queuectl dlq retry <job_id>` resets `attempts` to `0` and state to `pending`.
 
-Moving a job to the Dead Letter Queue (`state = 'dead'`) means automated retries were fully exhausted. Manually issuing `dlq retry` is an explicit action taken after an operator investigates and fixes the root cause (such as resolving a network deadlock or updating file permissions).
+Moving a job to the Dead Letter Queue (`state = 'dead'`) means automated retries were fully exhausted. Manually issuing `dlq retry` is an explicit action taken after an operator investigates and fixes the underlying root cause (such as resolving a network deadlock or updating file permissions).
 
 Once the underlying bug is resolved, the job should get a brand-new lifecycle with the full allocation of retries (`max_retries`) and initial exponential backoff delays ($base^1, base^2, ...$). Preserving the old attempt count would cause a single subsequent transient glitch to immediately throw the job back into DLQ without giving exponential retries a chance to work.
 
@@ -76,10 +76,10 @@ Once the underlying bug is resolved, the job should get a brand-new lifecycle wi
 
 ### Rejected Designs
 1. **PID File only (`/tmp/queuectl.pid`)**: Fragile when workers crash ungracefully, leaving stale PID files behind. Also fails across isolated container namespaces.
-2. **UNIX Socket / Control Server**: Running a local socket server (e.g., `/tmp/queuectl.sock`) adds unnecessary infrastructure and socket file cleanup edge cases.
+2. **UNIX Socket Server**: Adds unnecessary network/socket setup and socket file cleanup complexity.
 
 ### Chosen Design
-A database signaling approach ([`queuectl_engine/worker.py:L105-L116`](file:///home/vaish/Flam/queuectl_engine/worker.py#L105-L116)):
+Database signaling + signal escalation ([`queuectl_engine/worker.py:L105-L116`](file:///home/vaish/Flam/queuectl_engine/worker.py#L105-L116)):
 1. `queuectl worker stop` updates the shared `workers` table in SQLite, setting `status = 'stopping'`.
 2. It queries active worker PIDs and sends `SIGTERM` to each process.
 3. Workers check `status == 'stopping'` during their loop and handle `SIGTERM`.
@@ -95,7 +95,7 @@ A database signaling approach ([`queuectl_engine/worker.py:L105-L116`](file:///h
 - **Retry & DLQ Mechanics**: Exponential backoff math and DLQ state transitions operate identically.
 
 ### Parts That Change
-1. **Database Schema**: Add a `priority INTEGER DEFAULT 0` column to the `jobs` table (where higher numbers indicate higher priority).
+1. **Database Schema**: Add a `priority INTEGER DEFAULT 0` column to the `jobs` table.
 2. **Claim SQL Query**: Update the `ORDER BY` clause in `claim_job()` from:
    ```sql
    ORDER BY created_at ASC
@@ -104,4 +104,4 @@ A database signaling approach ([`queuectl_engine/worker.py:L105-L116`](file:///h
    ```sql
    ORDER BY priority DESC, created_at ASC
    ```
-3. **CLI Parser**: Add a `--priority` option to `queuectl enqueue`.
+3. **CLI Parser**: Add a `--priority` option for `queuectl enqueue`.
