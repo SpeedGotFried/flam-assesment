@@ -7,36 +7,29 @@ This document details the critical architectural decisions, concurrency mechanic
 ## 1. Atomic Job Claiming Across Processes
 
 ### Exact Line Reference
-The cross-process atomic job claiming logic is implemented in [`queuectl_engine/db.py:L125-L150`](file:///home/vaish/Flam/queuectl_engine/db.py#L125-L150) inside `Database.claim_job()`:
+The cross-process atomic job claiming logic is implemented in [`queuectl_engine/db.py:L103-L125`](file:///home/vaish/Flam/queuectl_engine/db.py#L103-L125) inside `Database.claim_job()`:
 
 ```python
 conn.execute("BEGIN IMMEDIATE")
 
-cursor = conn.execute("""
-    SELECT id, state, attempts, max_retries, command FROM jobs
+row = conn.execute("""
+    SELECT id FROM jobs
     WHERE state = 'pending'
        OR (state = 'failed' AND (run_at IS NULL OR run_at <= ?))
        OR (state = 'processing' AND (last_heartbeat IS NULL OR last_heartbeat <= ?))
-    ORDER BY created_at ASC
-    LIMIT 1
-""", (now_str, stale_threshold_str))
-row = cursor.fetchone()
+    ORDER BY created_at ASC LIMIT 1
+""", (now_str, stale_thresh)).fetchone()
 
 if not row:
     conn.execute("COMMIT")
     return None
 
 job_id = row["id"]
-
 conn.execute("""
     UPDATE jobs
-    SET state = 'processing',
-        worker_id = ?,
-        last_heartbeat = ?,
-        updated_at = ?
+    SET state = 'processing', worker_id = ?, last_heartbeat = ?, updated_at = ?
     WHERE id = ?
 """, (worker_id, now_str, now_str, job_id))
-
 conn.execute("COMMIT")
 ```
 
@@ -53,8 +46,8 @@ conn.execute("COMMIT")
 ### Step-by-Step Walkthrough
 Suppose Worker A is executing a job (`job_id = "job-42"`).
 
-1. **State during execution**: `job-42` has `state = 'processing'`, `worker_id = 'worker-A'`, and a continuously updated `last_heartbeat` timestamp (refreshed every 5 seconds by a background heartbeat thread in [`queuectl_engine/worker.py:L40-L55`](file:///home/vaish/Flam/queuectl_engine/worker.py#L40-L55)).
-2. **SIGKILL event**: Worker A receives a `SIGKILL` signal (or experiences a sudden OS crash / power loss). No cleanup handler or signal trap executes; the process dies instantly. `job-42` remains in SQLite with `state = 'processing'` and the last recorded `last_heartbeat` timestamp at the time of death.
+1. **State during execution**: `job-42` has `state = 'processing'`, `worker_id = 'worker-A'`, and a timestamp `last_heartbeat` set at claim time (and refreshed periodically in worker loop [`queuectl_engine/worker.py:L60`](file:///home/vaish/Flam/queuectl_engine/worker.py#L60)).
+2. **SIGKILL event**: Worker A receives a `SIGKILL` signal (or experiences a sudden OS crash / power loss). No cleanup handler or signal trap executes; the process dies instantly. `job-42` remains in SQLite with `state = 'processing'` and the recorded `last_heartbeat` timestamp at the time of claim/last iteration.
 3. **Detection by Active Workers**: When any worker (or a newly restarted worker) calls `claim_job()`, the SQL query evaluates:
    ```sql
    WHERE state = 'pending'
@@ -77,8 +70,8 @@ Suppose Worker A is executing a job (`job_id = "job-42"`).
 
 ### Justification
 1. **Manual Intervention Context**: Moving a job to the Dead Letter Queue (`state = 'dead'`) indicates that all automated exponential backoff retries (`max_retries`) have been exhausted.
-2. **Root Cause Resolution**: Operators inspect DLQ jobs after fixing an underlying dependency (e.g., restoring a broken API endpoint, resolving a database deadlock, or updating system permissions).
-3. **Fresh Retry Lifecycle**: When an operator explicitly issues `dlq retry <id>`, the intent is to grant the job a brand-new lifecycle with the full allocation of retry attempts and initial backoff delays (`base^1`, `base^2`, ...). Preserving `attempts = max_retries` would cause a single subsequent failure to immediately return the job to the DLQ without giving exponential retries a chance to work.
+2. **Root Cause Resolution**: Operators inspect DLQ jobs after fixing an underlying dependency like resolving a database deadlock, or updating system permissions.
+3. **Fresh Retry Lifecycle**: When an operator explicitly issues `dlq retry <id>`, the aim is to grant the job a brand-new lifecycle with the full allocation of retry attempts and initial backoff delays (`base^1`, `base^2`, ...). Preserving `attempts = max_retries` would cause a single subsequent failure to immediately return the job to the DLQ without giving exponential retries a chance to work.
 
 ---
 
@@ -93,7 +86,7 @@ Suppose Worker A is executing a job (`job_id = "job-42"`).
    - *Why Rejected*: Adds unnecessary network/socket setup overhead, socket file cleanup bugs on crashes, and permissions issues across multi-user environments.
 
 ### Chosen Design: Hybrid DB Signaling + Signal Escalation
-- **Mechanism**: [`queuectl_engine/worker.py:L140-L155`](file:///home/vaish/Flam/queuectl_engine/worker.py#L140-L155)
+- **Mechanism**: [`queuectl_engine/worker.py:L105-L116`](file:///home/vaish/Flam/queuectl_engine/worker.py#L105-L116)
 - **Implementation**:
   1. `queuectl worker stop` updates the shared `workers` DB table, setting `status = 'stopping'`.
   2. It queries active worker PIDs from the table and sends `SIGTERM` to each process.
