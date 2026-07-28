@@ -52,3 +52,7 @@ queuectl.db*
 .coverage
 htmlcov/
 .nox/
+
+# PDF documents
+*.pdf
+
