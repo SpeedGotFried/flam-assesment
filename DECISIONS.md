@@ -34,31 +34,24 @@ conn.execute("COMMIT")
 ### Why this operation is atomic
 Both the `SELECT` candidate query and the `UPDATE` state query happen inside a single `BEGIN IMMEDIATE` transaction.
 
-When a worker calls `claim_job()`, `BEGIN IMMEDIATE` acquires a reserved write lock on the SQLite database file before reading candidate rows. If another worker process in a different terminal session calls `claim_job()` at the exact same instant, SQLite blocks the second process until the first worker's transaction completes (`COMMIT`).
+When a worker calls `claim_job()`, `BEGIN IMMEDIATE` acquires a write lock on the SQLite database file before reading candidate rows. If another worker process calls `claim_job()` at the same instant, SQLite blocks the second process until the first worker's transaction completes (`COMMIT`).
 
-By the time the second worker acquires the write lock, the selected job has already been marked as `processing`. The second worker's `SELECT` query skips it and claims the next available `pending` job.
-
-Using WAL mode (`PRAGMA journal_mode=WAL;`) ensures reads don't block writes while write transactions remain strictly serialized.
+By the time the second worker acquires the write lock, the job has already been marked as `processing`. The second worker's `SELECT` query skips it and claims the next `pending` job.
 
 ---
 
 ## 2. A worker is SIGKILLed halfway through a job. Walk through, step by step, what state the job is in and how it eventually runs again. What is the worst-case delay before recovery?
 
 ### Walkthrough
-Imagine Worker A claims `job-42`:
+Imagine Worker A claims `job-1`:
 
-1. **Execution**: `job-42` has state `processing`, `worker_id` set to Worker A, and a `last_heartbeat` timestamp set when claimed (and updated during long loops in [`queuectl_engine/worker.py:L60`](file:///home/vaish/Flam/queuectl_engine/worker.py#L60)).
-2. **SIGKILL Crash**: `SIGKILL` kills Worker A instantly. No cleanup code runs. The job stays in SQLite marked as `processing`.
-3. **Detection**: Active workers periodically polling SQLite check for candidate jobs, matching `processing` jobs whose `last_heartbeat` timestamp is older than `stale_timeout` (30 seconds default):
+1. **Execution**: `job-1` has state `processing`, `worker_id` set to Worker A, and a `last_heartbeat` timestamp set when claimed (and updated during long loops in [`queuectl_engine/worker.py:L60`](file:///home/vaish/Flam/queuectl_engine/worker.py#L60)).
+2. **SIGKILL Crash**: `SIGKILL` kills Worker A instantly. No cleanup runs. The job stays in SQLite marked as `processing`.
+3. **Detection**: Active workers periodically polling SQLite check for candidate jobs, matching `processing` jobs whose `last_heartbeat` timestamp is older than `stale_timeout` (30 seconds):
    ```sql
-   OR (state = 'processing' AND (last_heartbeat IS NULL OR last_heartbeat <= :stale_threshold))
+   OR (state = 'processing' AND (last_heartbeat IS NULL OR last_heartbeat <= :stale_timeout))
    ```
-4. **Re-claiming & Execution**: A healthy worker detects `job-42` as stale, updates `worker_id` to itself, resets `last_heartbeat` to `now`, and executes the command from scratch.
-
-### Worst-Case Recovery Delay
-- **Stale Timeout**: 30 seconds default (`queuectl config set stale-timeout <seconds>`).
-- **Worker Poll Loop**: 0.5 seconds sleep when idle.
-- **Worst-Case Delay**: **30.5 seconds** (30s stale window + 0.5s poll loop delay), strictly under the required 60-second limit.
+4. **Re-claiming & Execution**: A healthy worker detects `job-1` as stale, updates `worker_id` to itself, resets `last_heartbeat` to `now`, and executes the command from scratch.
 
 ---
 
@@ -66,16 +59,16 @@ Imagine Worker A claims `job-42`:
 
 Yes, `queuectl dlq retry <job_id>` resets `attempts` to `0` and state to `pending`.
 
-Moving a job to the Dead Letter Queue (`state = 'dead'`) means automated retries were fully exhausted. Manually issuing `dlq retry` is an explicit action taken after an operator investigates and fixes the underlying root cause (such as resolving a network deadlock or updating file permissions).
+Moving a job to the Dead Letter Queue (`state = 'dead'`) means automated retries were fully exhausted. Manually issuing `dlq retry` is an explicit action taken after an operator investigates and fixes the underlying issues.
 
-Once the underlying bug is resolved, the job should get a brand-new lifecycle with the full allocation of retries (`max_retries`) and initial exponential backoff delays ($base^1, base^2, ...$). Preserving the old attempt count would cause a single subsequent transient glitch to immediately throw the job back into DLQ without giving exponential retries a chance to work.
+Once the issue is resolved, the job gets a brand-new lifecycle with the full `max_retries`.
 
 ---
 
 ## 4. What designs did you consider and reject for worker stop (cross-process signaling), and why?
 
 ### Rejected Designs
-1. **PID File only (`/tmp/queuectl.pid`)**: Fragile when workers crash ungracefully, leaving stale PID files behind. Also fails across isolated container namespaces.
+1. **PID File only**: Fragile when workers crash ungracefully, leaving stale PID files behind. Also fails across isolated container namespaces.
 2. **UNIX Socket Server**: Adds unnecessary network/socket setup and socket file cleanup complexity.
 
 ### Chosen Design
